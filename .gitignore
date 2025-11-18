@@ -1,0 +1,7 @@
+.venv
+.claude
+.mypy_cache
+.pytest_cache
+todo.md
+*.pyc
+*.pyo

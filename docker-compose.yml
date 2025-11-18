@@ -1,0 +1,26 @@
+services:
+  fxtunnel-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fxtunnel-server
+    restart: unless-stopped
+    ports:
+      - "9000:9000"     # Tunnel port
+      - "8080:8080"     # Health check
+    volumes:
+      - fxtunnel-data:/data
+    environment:
+      - FXTUNNEL_DATA_DIR=/data
+    # Override for custom configuration:
+    # command: ["server", "--port", "9000", "--health-port", "8080", "--allowed-ports", "5432,6379", "--log-json"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  fxtunnel-data:
+    driver: local

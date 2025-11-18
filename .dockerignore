@@ -1,0 +1,37 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv
+venv
+env
+*.egg-info
+.eggs
+dist
+build
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+
+# Testing
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov
+tests
+
+# Dev files
+todo.md
+
+# CI/CD
+.github
+.claude
