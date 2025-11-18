@@ -25,7 +25,7 @@ def configure_logging(
     """
     log_level = logging.DEBUG if verbose else logging.INFO
 
-    # Common processors for all output
+    # Shared processors for structlog
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
@@ -37,27 +37,22 @@ def configure_logging(
 
     if json_output:
         # JSON output for production
-        processors = shared_processors + [
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
-        ]
-        formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.processors.JSONRenderer(),
-            foreign_pre_chain=shared_processors,
-        )
+        final_processor = structlog.processors.JSONRenderer()
     else:
         # Console output for development
-        processors = shared_processors + [
-            structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
-        ]
-        formatter = structlog.stdlib.ProcessorFormatter(
-            processor=structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty()),
-            foreign_pre_chain=shared_processors,
-        )
+        final_processor = structlog.dev.ConsoleRenderer(colors=sys.stderr.isatty())
 
-    # Configure structlog
+    # Formatter for stdlib logging
+    formatter = structlog.stdlib.ProcessorFormatter(
+        processor=final_processor,
+        foreign_pre_chain=shared_processors,
+    )
+
+    # Configure structlog to use stdlib
     structlog.configure(
-        processors=processors,
+        processors=shared_processors + [
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ],
         wrapper_class=structlog.stdlib.BoundLogger,
         context_class=dict,
         logger_factory=structlog.stdlib.LoggerFactory(),

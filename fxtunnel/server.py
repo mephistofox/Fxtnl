@@ -173,10 +173,10 @@ class TunnelServer:
                 self.save_key(client_key)
                 logger.info(f"First client {addr} authorized (trust on first use)")
 
-                # Auth successful - set up encryption
+                # Auth successful - send AUTH_OK unencrypted, then enable encryption
+                await protocol.send(MsgType.AUTH_OK, 0)
                 cipher = Cipher(client_key)
                 protocol.set_cipher(cipher)
-                await protocol.send(MsgType.AUTH_OK, 0)
                 logger.info(f"Client {addr} authenticated")
             else:
                 # Challenge-response authentication
@@ -201,10 +201,10 @@ class TunnelServer:
                     await protocol.send(MsgType.AUTH_FAIL, 0, b"Invalid key")
                     return
 
-                # Auth successful - set up encryption
+                # Auth successful - send AUTH_OK unencrypted, then enable encryption
+                await protocol.send(MsgType.AUTH_OK, 0)
                 cipher = Cipher(self.authorized_key)
                 protocol.set_cipher(cipher)
-                await protocol.send(MsgType.AUTH_OK, 0)
                 logger.info(f"Client {addr} authenticated")
 
             # Register session
