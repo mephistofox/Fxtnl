@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-fxTunnel - Simple dev tunnel system.
+fxTunnel - Reverse tunnel system (like SSH -R).
+
+Expose local services to the internet via a remote server.
 
 Server: fxtunnel server
 Client: fxtunnel client --ip <server_ip> -L <local>:<remote> [-L ...]
 Connect: fxtunnel connect <profile>
+
+Architecture:
+[Internet] -> [Server:remote_port] -> [Tunnel] -> [Client] -> [localhost:local_port]
 """
 
 import argparse
@@ -18,12 +23,16 @@ from fxtunnel.logging import configure_logging
 
 def parse_tunnel_spec(spec: str) -> tuple[int, int, str]:
     """
-    Parse tunnel specification.
+    Parse tunnel specification for reverse tunneling.
 
     Formats:
-      - "5432:5432" -> (5432, 5432, "tcp")
-      - "5432:5432:tcp" -> (5432, 5432, "tcp")
+      - "8001:80" -> (8001, 80, "tcp") - expose localhost:8001 on server:80
+      - "8001:80:tcp" -> (8001, 80, "tcp")
       - "53:53:udp" -> (53, 53, "udp")
+
+    The format is LOCAL:REMOTE where:
+      - LOCAL = port of your local service (e.g., 8001)
+      - REMOTE = port to open on server (e.g., 80)
     """
     parts = spec.split(':')
     if len(parts) == 2:
@@ -47,22 +56,27 @@ def parse_tunnel_spec(spec: str) -> tuple[int, int, str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="fxTunnel - Simple dev tunnel system",
+        description="fxTunnel - Reverse tunnel system (like SSH -R)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+Expose local services to the internet via a remote server.
+
+Architecture:
+  [Internet] -> [Server:remote_port] -> [Tunnel] -> [Client] -> [localhost:local_port]
+
 Examples:
   Server (no config needed):
     fxtunnel server
-    fxtunnel server --port 8000
+    fxtunnel server --port 9000 --allowed-ports 80,443,8080
 
-  Client (single tunnel):
-    fxtunnel client --ip 192.168.1.100 -L 5432:5432
+  Client (expose local web app on port 8001 as server:80):
+    fxtunnel client --ip your-server.com -L 8001:80
 
-  Client (multiple tunnels):
-    fxtunnel client --ip 192.168.1.100 -L 5432:5432 -L 6379:6379 -L 8080:80
+  Client (expose multiple services):
+    fxtunnel client --ip your-server.com -L 8001:80 -L 3000:3000 -L 5432:5432
 
   Client (UDP mode):
-    fxtunnel client --ip 192.168.1.100 -L 53:53:udp
+    fxtunnel client --ip your-server.com -L 53:53:udp
 
   Connect using profile:
     fxtunnel connect dev
@@ -119,7 +133,7 @@ Examples:
     )
     server_parser.add_argument(
         "--allowed-ports", type=str,
-        help="Comma-separated list of allowed remote ports (e.g., 5432,6379,8080)"
+        help="Comma-separated list of ports that clients can expose (e.g., 80,443,8080)"
     )
     server_parser.add_argument(
         "--log-json", action="store_true",
@@ -137,24 +151,28 @@ Examples:
     # Client command
     client_parser = subparsers.add_parser(
         "client",
-        help="Run tunnel client",
+        help="Run tunnel client (expose local services)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Examples:
-  # Single tunnel
-  fxtunnel client --ip 192.168.1.100 -L 5432:5432
+Expose local services to the internet via a remote server.
 
-  # Multiple tunnels
-  fxtunnel client --ip 192.168.1.100 -L 5432:5432 -L 6379:6379 -L 8080:80
+Tunnel format: -L LOCAL:REMOTE[:MODE]
+  LOCAL  = port of your local service (e.g., 8001)
+  REMOTE = port to open on server (e.g., 80)
+  MODE   = tcp (default) or udp
+
+Examples:
+  # Expose local web app (localhost:8001) on server port 80
+  fxtunnel client --ip your-server.com -L 8001:80
+
+  # Expose multiple services
+  fxtunnel client --ip your-server.com -L 8001:80 -L 3000:3000
 
   # UDP tunnel
-  fxtunnel client --ip 192.168.1.100 -L 53:53:udp
+  fxtunnel client --ip your-server.com -L 53:53:udp
 
   # Auto-accept new server
-  fxtunnel client --ip 192.168.1.100 -L 5432:5432 --accept-new-host
-
-  # Bind to all interfaces
-  fxtunnel client --ip 192.168.1.100 -L 5432:5432 --bind 0.0.0.0
+  fxtunnel client --ip your-server.com -L 8001:80 --accept-new-host
 """
     )
     client_parser.add_argument(
@@ -167,16 +185,16 @@ Examples:
     )
     client_parser.add_argument(
         "-L", action="append", dest="tunnels", metavar="LOCAL:REMOTE[:MODE]",
-        help="Tunnel specification (can be used multiple times)"
+        help="Expose LOCAL port on server's REMOTE port (can be used multiple times)"
     )
     # Legacy single tunnel options
     client_parser.add_argument(
         "--local", type=int,
-        help="Local port (legacy, use -L instead)"
+        help="Local service port to expose (legacy, use -L instead)"
     )
     client_parser.add_argument(
         "--remote", type=int,
-        help="Remote port (legacy, use -L instead)"
+        help="Server port to open (legacy, use -L instead)"
     )
     client_parser.add_argument(
         "--udp", action="store_true",

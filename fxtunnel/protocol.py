@@ -20,10 +20,11 @@ class MsgType(IntEnum):
     AUTH_RESPONSE = 3  # Client sends HMAC response
     AUTH_OK = 4        # Auth successful
     AUTH_FAIL = 5      # Auth failed
-    OPEN_PORT = 10     # Request to open port
-    PORT_OPENED = 11   # Port opened successfully
-    PORT_ERROR = 12    # Failed to open port
-    NEW_CONN = 20      # New connection on remote port
+    OPEN_PORT = 10     # Request to open port (client -> server)
+    PORT_OPENED = 11   # Port opened successfully (server -> client)
+    PORT_ERROR = 12    # Failed to open port (server -> client)
+    NEW_CONN = 20      # New incoming connection (server -> client for reverse tunnel)
+    CONN_READY = 22    # Client ready to handle connection (client -> server)
     CONN_CLOSED = 21   # Connection closed
     DATA = 30          # Data packet
     PING = 40          # Heartbeat ping

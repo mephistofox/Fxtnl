@@ -1,8 +1,12 @@
 """
-Tunnel server - no configuration required.
+Tunnel server - reverse tunnel mode (like SSH -R).
 
-Listens on port 9000, waits for client connection.
-When client sends NEW_CONN, connects to localhost:remote_port.
+Listens on port 9000 for tunnel client connection.
+Client sends OPEN_PORT request, server starts listening on that port.
+When external connections arrive, server notifies client to connect to local service.
+
+Architecture:
+[Internet] -> [Server:remote_port] -> [Tunnel] -> [Client] -> [localhost:local_port]
 """
 
 import asyncio
@@ -16,7 +20,8 @@ from typing import Optional
 from .protocol import (
     FramedProtocol, Cipher, MsgType,
     generate_key, hex_to_key, key_to_hex,
-    parse_new_conn_msg,
+    parse_open_port_msg,
+    build_new_conn_msg,
     generate_challenge, verify_auth_response
 )
 from .logging import get_logger, bind_context, clear_context
@@ -45,11 +50,17 @@ class ClientSession:
     def __init__(self, addr: tuple, protocol: FramedProtocol):
         self.addr = addr
         self.protocol = protocol
+        # Connections from external clients (conn_id -> streams)
         self.connections: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+        # Pending connections waiting for client CONN_READY
+        self.pending_connections: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
+        # Public-facing servers (remote_port -> (server, local_port))
+        self.public_servers: dict[int, tuple[asyncio.Server, int]] = {}
         self.udp_transports: dict[int, asyncio.DatagramTransport] = {}
         self.running = False
         self._heartbeat_task: Optional[asyncio.Task] = None
         self._tasks: list[asyncio.Task] = []
+        self._conn_counter = 0
 
         # Statistics
         self.bytes_sent = 0
@@ -58,7 +69,7 @@ class ClientSession:
 
 
 class TunnelServer:
-    """Main tunnel server."""
+    """Main tunnel server for reverse tunneling."""
 
     def __init__(self, max_clients: int = 10, allowed_ports: list[int] | None = None):
         self.authorized_key: Optional[bytes] = None
@@ -243,7 +254,7 @@ class TunnelServer:
                 await asyncio.gather(*session._tasks, return_exceptions=True)
             session._tasks.clear()
 
-            # Close all connections
+            # Close all connections and public servers
             await self._cleanup_session(session)
 
             # Send shutdown notification to client
@@ -298,19 +309,32 @@ class TunnelServer:
 
     async def _handle_message(self, session: ClientSession, msg_type: MsgType, conn_id: int, data: bytes):
         """Handle a single message."""
-        if msg_type == MsgType.NEW_CONN:
-            port, is_udp = parse_new_conn_msg(data)
-            if is_udp:
-                await self._open_udp_connection(session, conn_id, port)
+        if msg_type == MsgType.OPEN_PORT:
+            # Client requests to open a public port for reverse tunnel
+            port, mode = parse_open_port_msg(data)
+            if mode == "udp":
+                await self._open_public_udp_port(session, port)
             else:
-                await self._open_connection(session, conn_id, port)
+                await self._open_public_port(session, port)
+
+        elif msg_type == MsgType.CONN_READY:
+            # Client is ready to handle connection - move from pending to active
+            if conn_id in session.pending_connections:
+                reader, writer = session.pending_connections.pop(conn_id)
+                session.connections[conn_id] = (reader, writer)
+                # Start reading from external client
+                task = asyncio.create_task(self._read_from_external(session, conn_id, reader))
+                session._tasks.append(task)
+                logger.debug(f"Connection {conn_id} activated")
+            else:
+                logger.warning(f"CONN_READY for unknown connection {conn_id}")
 
         elif msg_type == MsgType.DATA:
             session.bytes_received += len(data)
-            await self._forward_data(session, conn_id, data)
+            await self._forward_to_external(session, conn_id, data)
 
         elif msg_type == MsgType.CONN_CLOSED:
-            await self._close_connection(session, conn_id)
+            await self._close_external_connection(session, conn_id)
 
         elif msg_type == MsgType.PING:
             await session.protocol.send(MsgType.PONG, 0)
@@ -322,53 +346,68 @@ class TunnelServer:
             logger.info(f"Client {session.addr} requested graceful shutdown")
             session.running = False
 
-    async def _open_connection(self, session: ClientSession, conn_id: int, port: int):
-        """Open connection to localhost:port."""
+    async def _open_public_port(self, session: ClientSession, port: int):
+        """Open a public-facing TCP port for incoming connections."""
         # Check port access
         if not self.is_port_allowed(port):
-            logger.warning("Port not allowed", port=port, conn_id=conn_id)
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            logger.warning("Port not allowed", port=port)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, f"Port {port} not allowed".encode())
+            return
+
+        # Check if already listening on this port
+        if port in session.public_servers:
+            logger.warning("Already listening on port", port=port)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, f"Already listening on {port}".encode())
             return
 
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection('localhost', port),
-                timeout=10
+            # Create handler that captures session and port
+            async def handle_external_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+                await self._handle_external_connection(session, reader, writer, port)
+
+            server = await asyncio.start_server(
+                handle_external_conn,
+                '0.0.0.0', port
             )
-            session.connections[conn_id] = (reader, writer)
-            session.connections_total += 1
-            logger.debug("Connected to local service", port=port, conn_id=conn_id)
 
-            # Start reading from local connection
-            task = asyncio.create_task(self._read_from_local(session, conn_id, reader))
-            session._tasks.append(task)
+            session.public_servers[port] = (server, port)
+            logger.info("Listening on public port", port=port)
+            await session.protocol.send(MsgType.PORT_OPENED, 0, build_new_conn_msg(port))
 
-        except ConnectionRefusedError:
-            logger.error("Connection refused - is the service running?", port=port, conn_id=conn_id)
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
-        except asyncio.TimeoutError:
-            logger.error("Timeout connecting to local service", port=port, conn_id=conn_id)
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
+        except PermissionError:
+            error_msg = f"Permission denied for port {port}"
+            logger.error(error_msg)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, error_msg.encode())
+        except OSError as e:
+            if e.errno == 98:  # Address already in use
+                error_msg = f"Port {port} is already in use"
+            else:
+                error_msg = f"Failed to listen on port {port}: {e}"
+            logger.error(error_msg)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, error_msg.encode())
         except Exception as e:
-            logger.error("Failed to connect to local service", port=port, conn_id=conn_id, error=str(e))
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            error_msg = f"Failed to open port {port}: {e}"
+            logger.error(error_msg)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, error_msg.encode())
 
-    async def _open_udp_connection(self, session: ClientSession, conn_id: int, port: int):
-        """Open UDP connection to localhost:port."""
+    async def _open_public_udp_port(self, session: ClientSession, port: int):
+        """Open a public-facing UDP port for incoming datagrams."""
         # Check port access
         if not self.is_port_allowed(port):
-            logger.warning(f"UDP port {port} not allowed for client {session.addr}")
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            logger.warning(f"UDP port {port} not allowed")
+            await session.protocol.send(MsgType.PORT_ERROR, 0, f"Port {port} not allowed".encode())
             return
 
         try:
             loop = asyncio.get_event_loop()
 
             class UDPServerProtocol(asyncio.DatagramProtocol):
-                def __init__(self, session, conn_id):
+                def __init__(self, session, port):
                     self.session = session
-                    self.conn_id = conn_id
+                    self.port = port
                     self.transport = None
+                    self.clients: dict[tuple, int] = {}  # addr -> conn_id
+                    self.conn_to_addr: dict[int, tuple] = {}  # conn_id -> addr
 
                 def connection_made(self, transport):
                     self.transport = transport
@@ -376,29 +415,80 @@ class TunnelServer:
                 def datagram_received(self, data, addr):
                     if not self.session.running:
                         return
+
+                    if addr not in self.clients:
+                        self.session._conn_counter += 1
+                        self.session.connections_total += 1
+                        conn_id = self.session._conn_counter
+                        self.clients[addr] = conn_id
+                        self.conn_to_addr[conn_id] = addr
+                        # Register for data routing
+                        self.session.udp_transports[conn_id] = self.transport
+                        logger.debug(f"New UDP client from {addr} -> conn {conn_id}")
+
+                    conn_id = self.clients[addr]
                     self.session.bytes_sent += len(data)
                     asyncio.create_task(
-                        self.session.protocol.send(MsgType.DATA, self.conn_id, data)
+                        self.session.protocol.send(MsgType.DATA, conn_id, data)
                     )
 
                 def error_received(self, exc):
-                    logger.debug(f"UDP error for conn {self.conn_id}: {exc}")
+                    logger.debug(f"UDP error on port {self.port}: {exc}")
 
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: UDPServerProtocol(session, conn_id),
-                remote_addr=('localhost', port)
+            transport, protocol = await loop.create_datagram_endpoint(
+                lambda: UDPServerProtocol(session, port),
+                local_addr=('0.0.0.0', port)
             )
 
-            session.udp_transports[conn_id] = transport
-            session.connections_total += 1
-            logger.debug(f"UDP connected to localhost:{port} for conn {conn_id}")
+            # Store protocol for sending responses
+            session.public_servers[port] = (transport, port)
+            logger.info(f"UDP listening on public port {port}")
+            await session.protocol.send(MsgType.PORT_OPENED, 0, build_new_conn_msg(port, is_udp=True))
 
         except Exception as e:
-            logger.error(f"Failed to create UDP connection to localhost:{port}: {e}")
-            await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            error_msg = f"Failed to open UDP port {port}: {e}"
+            logger.error(error_msg)
+            await session.protocol.send(MsgType.PORT_ERROR, 0, error_msg.encode())
 
-    async def _read_from_local(self, session: ClientSession, conn_id: int, reader: asyncio.StreamReader):
-        """Read from local connection and forward to tunnel."""
+    async def _handle_external_connection(self, session: ClientSession, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, port: int):
+        """Handle new connection from external client on public port."""
+        if not session.running:
+            writer.close()
+            await writer.wait_closed()
+            return
+
+        # Assign connection ID
+        session._conn_counter += 1
+        session.connections_total += 1
+        conn_id = session._conn_counter
+
+        addr = writer.get_extra_info('peername')
+        logger.debug(f"External connection {conn_id} from {addr} on port {port}")
+
+        # Store as pending until client sends CONN_READY
+        session.pending_connections[conn_id] = (reader, writer)
+
+        try:
+            # Notify client about new incoming connection
+            await session.protocol.send(MsgType.NEW_CONN, conn_id, build_new_conn_msg(port))
+
+            # Wait for client to respond with CONN_READY (with timeout)
+            # The actual handling happens in _handle_message when CONN_READY arrives
+            # If client doesn't respond, the connection will be cleaned up on session close
+
+        except Exception as e:
+            logger.error(f"Failed to notify client of connection {conn_id}: {e}")
+            # Clean up pending connection
+            if conn_id in session.pending_connections:
+                _, w = session.pending_connections.pop(conn_id)
+                w.close()
+                try:
+                    await w.wait_closed()
+                except Exception:
+                    pass
+
+    async def _read_from_external(self, session: ClientSession, conn_id: int, reader: asyncio.StreamReader):
+        """Read from external connection and forward to tunnel client."""
         try:
             while session.running:
                 data = await reader.read(4096)
@@ -407,7 +497,7 @@ class TunnelServer:
                 session.bytes_sent += len(data)
                 await session.protocol.send(MsgType.DATA, conn_id, data)
         except ConnectionResetError:
-            logger.debug(f"Connection {conn_id} reset by local service")
+            logger.debug(f"Connection {conn_id} reset by external client")
         except BrokenPipeError:
             logger.debug(f"Connection {conn_id} broken pipe")
         except Exception as e:
@@ -420,18 +510,20 @@ class TunnelServer:
 
             # Connection closed
             if conn_id in session.connections:
-                await self._close_connection(session, conn_id)
+                await self._close_external_connection(session, conn_id)
                 try:
                     await session.protocol.send(MsgType.CONN_CLOSED, conn_id)
                 except Exception:
                     pass
 
-    async def _forward_data(self, session: ClientSession, conn_id: int, data: bytes):
-        """Forward data to local connection (TCP or UDP)."""
+    async def _forward_to_external(self, session: ClientSession, conn_id: int, data: bytes):
+        """Forward data from tunnel client to external connection."""
         # Check UDP first
         if conn_id in session.udp_transports:
             transport = session.udp_transports[conn_id]
             try:
+                # For UDP we need to find the client address
+                # This is handled by the UDPServerProtocol
                 transport.sendto(data)
             except Exception as e:
                 logger.debug(f"Failed to forward UDP to conn {conn_id}: {e}")
@@ -448,10 +540,21 @@ class TunnelServer:
             await writer.drain()
         except Exception as e:
             logger.debug(f"Failed to forward to conn {conn_id}: {e}")
-            await self._close_connection(session, conn_id)
+            await self._close_external_connection(session, conn_id)
 
-    async def _close_connection(self, session: ClientSession, conn_id: int):
-        """Close a local connection."""
+    async def _close_external_connection(self, session: ClientSession, conn_id: int):
+        """Close an external connection."""
+        # Check pending first
+        if conn_id in session.pending_connections:
+            _, writer = session.pending_connections.pop(conn_id)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            logger.debug(f"Closed pending connection {conn_id}")
+            return
+
         if conn_id not in session.connections:
             return
 
@@ -477,9 +580,30 @@ class TunnelServer:
 
     async def _cleanup_session(self, session: ClientSession):
         """Clean up session resources."""
+        # Close all public servers
+        for port, (server, _) in list(session.public_servers.items()):
+            if hasattr(server, 'close'):
+                server.close()
+                if hasattr(server, 'wait_closed'):
+                    try:
+                        await server.wait_closed()
+                    except Exception:
+                        pass
+            logger.debug(f"Closed public server on port {port}")
+        session.public_servers.clear()
+
+        # Close pending connections
+        for conn_id in list(session.pending_connections.keys()):
+            _, writer = session.pending_connections.pop(conn_id)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
         # Close TCP connections
         for conn_id in list(session.connections.keys()):
-            await self._close_connection(session, conn_id)
+            await self._close_external_connection(session, conn_id)
 
         # Close UDP transports
         for conn_id, transport in list(session.udp_transports.items()):

@@ -1,7 +1,11 @@
 """
-Tunnel client - connects to server and manages tunnels.
+Tunnel client - reverse tunnel mode (like SSH -R).
 
-Client generates key on first run, sends all configuration to server.
+Client connects to server and requests ports to be opened publicly.
+When server receives incoming connection, client connects to local service.
+
+Architecture:
+[Internet] -> [Server:remote_port] -> [Tunnel] -> [Client] -> [localhost:local_port]
 """
 
 import asyncio
@@ -17,7 +21,8 @@ from typing import Optional, Literal
 from .protocol import (
     FramedProtocol, Cipher, MsgType,
     generate_key, hex_to_key, key_to_hex,
-    build_new_conn_msg,
+    build_open_port_msg,
+    parse_new_conn_msg,
     compute_auth_response
 )
 from .logging import get_logger, bind_context, clear_context
@@ -81,7 +86,7 @@ def compute_fingerprint(key: bytes) -> str:
 
 
 class TunnelClient:
-    """Tunnel client."""
+    """Tunnel client for reverse tunneling."""
 
     def __init__(self, server_ip: str, server_port: int = 9000, bind_address: str = "localhost", accept_new_host: bool = False):
         self.server_ip = server_ip
@@ -90,10 +95,15 @@ class TunnelClient:
         self.accept_new_host = accept_new_host
         self.key: Optional[bytes] = None
         self.protocol: Optional[FramedProtocol] = None
-        self.tunnels: list[tuple[int, int, str]] = []  # (local_port, remote_port, mode)
+        # Tunnel config: (local_port, remote_port, mode)
+        # local_port = where to connect locally (the app)
+        # remote_port = where server should listen (exposed port)
+        self.tunnels: list[tuple[int, int, str]] = []
+        # Mapping from remote_port to local_port for routing
+        self.port_mapping: dict[int, int] = {}
+        # Active connections to local services (conn_id -> streams)
         self.connections: dict[int, tuple[asyncio.StreamReader, asyncio.StreamWriter]] = {}
         self.udp_proxies: dict[int, 'UDPLocalProxy'] = {}  # conn_id -> proxy
-        self.local_servers: list[asyncio.Server] = []
 
         # State machine
         self._state = ConnectionState.DISCONNECTED
@@ -150,8 +160,16 @@ class TunnelClient:
             logger.info(f"Key fingerprint: {compute_fingerprint(self.key)}")
 
     def add_tunnel(self, local_port: int, remote_port: int, mode: str = "tcp"):
-        """Add a tunnel configuration."""
+        """
+        Add a tunnel configuration.
+
+        Args:
+            local_port: Port of local service to expose (e.g., 8001)
+            remote_port: Port on server to listen on (e.g., 80)
+            mode: 'tcp' or 'udp'
+        """
         self.tunnels.append((local_port, remote_port, mode))
+        self.port_mapping[remote_port] = local_port
 
     async def connect(self) -> bool:
         """Connect to tunnel server."""
@@ -310,62 +328,69 @@ class TunnelClient:
             await self._set_state(ConnectionState.DISCONNECTED)
             return False
 
-    async def start_local_listeners(self):
-        """Start local port listeners."""
+    async def request_ports(self):
+        """Request server to open public ports for reverse tunneling."""
         for local_port, remote_port, mode in self.tunnels:
             try:
-                if mode == "tcp":
-                    server = await asyncio.start_server(
-                        lambda r, w, rp=remote_port: self._handle_local_connection(r, w, rp),
-                        self.bind_address, local_port
-                    )
-                    self.local_servers.append(server)
-                    logger.info(f"Listening on {self.bind_address}:{local_port} -> remote:{remote_port}")
-
-                elif mode == "udp":
-                    # UDP support
-                    loop = asyncio.get_event_loop()
-                    proxy = UDPLocalProxy(self, remote_port)
-                    transport, _ = await loop.create_datagram_endpoint(
-                        lambda p=proxy: p,
-                        local_addr=(self.bind_address, local_port)
-                    )
-                    self.local_servers.append(transport)
-                    # Store proxy for data routing (will be registered when connections are made)
-                    proxy._client_ref = self
-                    logger.info(f"UDP listening on {self.bind_address}:{local_port} -> remote:{remote_port}")
-
-            except PermissionError:
-                logger.error(f"Permission denied for port {local_port} - try a port > 1024 or run as root")
-                return False
-            except OSError as e:
-                if e.errno == 98:  # Address already in use
-                    logger.error(f"Port {local_port} is already in use")
-                else:
-                    logger.error(f"Failed to listen on port {local_port}: {e}")
-                return False
+                await self.protocol.send(
+                    MsgType.OPEN_PORT, 0,
+                    build_open_port_msg(remote_port, mode)
+                )
+                logger.info(f"Requested port {remote_port} ({mode}) -> localhost:{local_port}")
             except Exception as e:
-                logger.error(f"Failed to listen on port {local_port}: {e}")
+                logger.error(f"Failed to request port {remote_port}: {e}")
                 return False
-
         return True
 
-    async def _handle_local_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, remote_port: int):
-        """Handle new local TCP connection."""
-        self._conn_counter += 1
+    async def _handle_new_connection(self, conn_id: int, remote_port: int, is_udp: bool = False):
+        """
+        Handle notification of new incoming connection on server.
+        Connect to local service and signal readiness.
+        """
+        local_port = self.port_mapping.get(remote_port)
+        if local_port is None:
+            logger.warning(f"Unknown remote port {remote_port} for connection {conn_id}")
+            await self.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            return
+
         self.connections_total += 1
-        conn_id = self._conn_counter
 
-        addr = writer.get_extra_info('peername')
-        logger.debug(f"New local connection {conn_id} from {addr}")
+        if is_udp:
+            # UDP handling
+            # For UDP we don't need to connect - just signal ready
+            await self.protocol.send(MsgType.CONN_READY, conn_id)
+            logger.debug(f"UDP connection {conn_id} ready for port {remote_port} -> localhost:{local_port}")
+        else:
+            # TCP - connect to local service
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection('localhost', local_port),
+                    timeout=10
+                )
+                self.connections[conn_id] = (reader, writer)
 
-        self.connections[conn_id] = (reader, writer)
+                # Signal to server that we're ready
+                await self.protocol.send(MsgType.CONN_READY, conn_id)
 
+                logger.debug(f"Connection {conn_id}: localhost:{local_port} connected")
+
+                # Start reading from local service
+                task = asyncio.create_task(self._read_from_local(conn_id, reader))
+                self._tasks.append(task)
+
+            except ConnectionRefusedError:
+                logger.error(f"Connection refused - is service running on localhost:{local_port}?")
+                await self.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout connecting to localhost:{local_port}")
+                await self.protocol.send(MsgType.CONN_CLOSED, conn_id)
+            except Exception as e:
+                logger.error(f"Failed to connect to localhost:{local_port}: {e}")
+                await self.protocol.send(MsgType.CONN_CLOSED, conn_id)
+
+    async def _read_from_local(self, conn_id: int, reader: asyncio.StreamReader):
+        """Read from local service and forward to tunnel."""
         try:
-            # Tell server to open connection to remote port
-            await self.protocol.send(MsgType.NEW_CONN, conn_id, build_new_conn_msg(remote_port))
-
-            # Read from local and forward to tunnel
             while self.is_running and self.is_connected:
                 data = await reader.read(4096)
                 if not data:
@@ -374,12 +399,17 @@ class TunnelClient:
                 await self.protocol.send(MsgType.DATA, conn_id, data)
 
         except ConnectionResetError:
-            logger.debug(f"Connection {conn_id} reset by peer")
+            logger.debug(f"Connection {conn_id} reset by local service")
         except BrokenPipeError:
             logger.debug(f"Connection {conn_id} broken pipe")
         except Exception as e:
             logger.debug(f"Local connection {conn_id} error: {e}")
         finally:
+            # Remove task from list
+            task = asyncio.current_task()
+            if task in self._tasks:
+                self._tasks.remove(task)
+
             # Notify server
             if self.is_connected and self.protocol:
                 try:
@@ -387,23 +417,17 @@ class TunnelClient:
                 except Exception:
                     pass
 
-            self.connections.pop(conn_id, None)
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            logger.debug(f"Local connection {conn_id} closed")
+            await self._close_local_connection(conn_id)
 
     async def run(self):
         """Main client loop with auto-reconnect."""
-        # Start local listeners first
-        if not await self.start_local_listeners():
-            logger.error("Failed to start local listeners")
-            return
-
         while self.is_running:
             if await self.connect():
+                # Request ports to be opened
+                if not await self.request_ports():
+                    await self._disconnect()
+                    continue
+
                 # Start tasks
                 self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
                 self._recv_task = asyncio.create_task(self._receive_loop())
@@ -429,9 +453,6 @@ class TunnelClient:
             logger.info(f"Reconnecting in {delay:.1f}s...")
             await asyncio.sleep(delay)
 
-        # Cleanup local servers
-        await self._cleanup_local()
-
     async def _receive_loop(self):
         """Receive and handle messages from server."""
         while self.is_running and self.is_connected:
@@ -453,7 +474,22 @@ class TunnelClient:
 
     async def _handle_message(self, msg_type: MsgType, conn_id: int, data: bytes):
         """Handle message from server."""
-        if msg_type == MsgType.DATA:
+        if msg_type == MsgType.PORT_OPENED:
+            port, is_udp = parse_new_conn_msg(data)
+            mode = "udp" if is_udp else "tcp"
+            local_port = self.port_mapping.get(port, "?")
+            logger.info(f"Port {port} ({mode}) opened -> localhost:{local_port}")
+
+        elif msg_type == MsgType.PORT_ERROR:
+            error_msg = data.decode() if data else "Unknown error"
+            logger.error(f"Port error: {error_msg}")
+
+        elif msg_type == MsgType.NEW_CONN:
+            # Server is notifying us of a new incoming connection
+            remote_port, is_udp = parse_new_conn_msg(data)
+            await self._handle_new_connection(conn_id, remote_port, is_udp)
+
+        elif msg_type == MsgType.DATA:
             self.bytes_received += len(data)
             await self._forward_to_local(conn_id, data)
 
@@ -475,7 +511,7 @@ class TunnelClient:
         """Forward data to local connection (TCP or UDP)."""
         # Check UDP proxy first
         if conn_id in self.udp_proxies:
-            self.udp_proxies[conn_id].send_to_client(conn_id, data)
+            self.udp_proxies[conn_id].send_to_local(data)
             return
 
         # TCP connection
@@ -500,6 +536,7 @@ class TunnelClient:
             await writer.wait_closed()
         except Exception:
             pass
+        logger.debug(f"Closed local connection {conn_id}")
 
     async def _heartbeat_loop(self):
         """Send periodic heartbeats."""
@@ -530,6 +567,10 @@ class TunnelClient:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+        # Close all local connections
+        for conn_id in list(self.connections.keys()):
+            await self._close_local_connection(conn_id)
+
         # Close protocol
         if self.protocol:
             self.protocol.close()
@@ -538,23 +579,6 @@ class TunnelClient:
             except Exception:
                 pass
             self.protocol = None
-
-    async def _cleanup_local(self):
-        """Cleanup local servers and connections."""
-        # Close local servers
-        for server in self.local_servers:
-            if hasattr(server, 'close'):
-                server.close()
-                if hasattr(server, 'wait_closed'):
-                    try:
-                        await server.wait_closed()
-                    except Exception:
-                        pass
-        self.local_servers.clear()
-
-        # Close connections
-        for conn_id in list(self.connections.keys()):
-            await self._close_local_connection(conn_id)
 
     async def stop(self):
         """Stop the client gracefully."""
@@ -582,52 +606,39 @@ class TunnelClient:
             loop.run_until_complete(self.stop())
 
 
-class UDPLocalProxy(asyncio.DatagramProtocol):
-    """Local UDP proxy."""
+class UDPLocalProxy:
+    """Local UDP proxy for forwarding UDP data to local service."""
 
-    def __init__(self, client: TunnelClient, remote_port: int):
+    def __init__(self, client: TunnelClient, local_port: int, conn_id: int):
         self.client = client
-        self.remote_port = remote_port
+        self.local_port = local_port
+        self.conn_id = conn_id
         self.transport = None
-        self.clients: dict[tuple, int] = {}  # addr -> conn_id
-        self.conn_to_addr: dict[int, tuple] = {}  # conn_id -> addr
 
-    def connection_made(self, transport):
-        self.transport = transport
-
-    def datagram_received(self, data, addr):
-        if not self.client.is_connected:
-            return
-
-        if addr not in self.clients:
-            self.client._conn_counter += 1
-            self.client.connections_total += 1
-            conn_id = self.client._conn_counter
-            self.clients[addr] = conn_id
-            self.conn_to_addr[conn_id] = addr
-            # Register this proxy for the conn_id
-            self.client.udp_proxies[conn_id] = self
-            # Send NEW_CONN with UDP flag
-            asyncio.create_task(
-                self.client.protocol.send(
-                    MsgType.NEW_CONN,
-                    conn_id,
-                    build_new_conn_msg(self.remote_port, is_udp=True)
-                )
-            )
-            logger.debug(f"New UDP client {addr} -> conn {conn_id}")
-
-        conn_id = self.clients[addr]
-        self.client.bytes_sent += len(data)
-        asyncio.create_task(
-            self.client.protocol.send(MsgType.DATA, conn_id, data)
+    async def start(self):
+        """Start UDP socket to local service."""
+        loop = asyncio.get_event_loop()
+        self.transport, _ = await loop.create_datagram_endpoint(
+            lambda: self,
+            remote_addr=('localhost', self.local_port)
         )
 
-    def send_to_client(self, conn_id: int, data: bytes):
-        """Send data back to the UDP client."""
-        if conn_id in self.conn_to_addr:
-            addr = self.conn_to_addr[conn_id]
-            self.transport.sendto(data, addr)
+    def send_to_local(self, data: bytes):
+        """Send data to local UDP service."""
+        if self.transport:
+            self.transport.sendto(data)
+
+    def datagram_received(self, data, addr):
+        """Receive data from local service and forward to tunnel."""
+        if not self.client.is_connected:
+            return
+        self.client.bytes_sent += len(data)
+        asyncio.create_task(
+            self.client.protocol.send(MsgType.DATA, self.conn_id, data)
+        )
+
+    def error_received(self, exc):
+        logger.debug(f"UDP error for conn {self.conn_id}: {exc}")
 
 
 async def run_client(
@@ -638,7 +649,19 @@ async def run_client(
     verbose: bool = False,
     accept_new_host: bool = False
 ):
-    """Run the tunnel client."""
+    """
+    Run the tunnel client.
+
+    Args:
+        server_ip: Server IP address
+        tunnels: List of (local_port, remote_port, mode) tuples
+                 local_port = where to connect locally (the app)
+                 remote_port = where server should listen (exposed port)
+        server_port: Server tunnel port
+        bind: Local bind address (not used in reverse tunnel mode)
+        verbose: Enable verbose logging
+        accept_new_host: Auto-accept new server fingerprints
+    """
     bind_context(server=f"{server_ip}:{server_port}")
     client = TunnelClient(server_ip, server_port, bind, accept_new_host)
     client.load_or_generate_key()
@@ -673,4 +696,4 @@ async def run_client(
 
 
 if __name__ == "__main__":
-    asyncio.run(run_client("127.0.0.1", [(5432, 5432, "tcp")]))
+    asyncio.run(run_client("127.0.0.1", [(8001, 8001, "tcp")]))
